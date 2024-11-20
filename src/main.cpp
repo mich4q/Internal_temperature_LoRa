@@ -1,106 +1,127 @@
-#include <Arduino.h>
-#include "LoRaRadio.h"
+#include <Adafruit_Sensor.h>
+#include <DHT.h>
+#include <DHT_U.h>
+#include <LoRaRadio.h>
 
-HardwareSerial SerialLora(D2, D8);
+// Konfiguracja trybu pracy (nadawca/odbiornik)
+#define IS_SENDER true // Ustaw na `false`, aby włączyć tryb odbiornika
+
+// Konfiguracja DHT22 (dla nadajnika)
+#define DHTPIN D7       // Pin, do którego podłączony jest DHT22
+#define DHTTYPE DHT22   // Typ czujnika (DHT22)
+DHT dht(DHTPIN, DHTTYPE);
+
+void handleSender();
+void handleReceiver();
+void encodeToBytes(float value, uint8_t *data);
+float decodeToFloat(uint8_t *data);
 
 
-bool isSender = false;
+// Konfiguracja LoRa
+HardwareSerial SerialLora(D2, D8); // Serial dla modułu LoRa (RX, TX)
 
-
-int timer = 0;
-#define SEND_PERIOD_MS 1000  
-
-
-void enableTemperatureSensor() {
-    RCC->APB2ENR |= RCC_APB2ENR_ADC1EN;  // Włącz zegar dla ADC1
-    ADC->CCR |= ADC_CCR_TSVREFE;        // Włącz sensor temperatury
-}
-
-void configureADC() {
-    ADC1->SMPR2 |= ADC_SMPR2_SMP16;     // Ustaw czas próbkowania dla kanału 16
-    ADC1->SQR5 |= 16;                   // Ustaw kanał 16 (sensor temperatury) w kolejce
-    ADC1->CR2 |= ADC_CR2_ADON;          // Włącz ADC
-    delay(1);                           // Poczekaj na stabilizację ADC
-}
-
-uint16_t readTemperatureADC() {
-    ADC1->CR2 |= ADC_CR2_SWSTART;       // Rozpocznij konwersję
-    while (!(ADC1->SR & ADC_SR_EOC));   // Czekaj na zakończenie konwersji
-    return ADC1->DR;                    // Pobierz wynik konwersji
-}
-
-float calculateTemperature(uint16_t adcValue) {
-    const uint16_t *TS_CAL1 = (uint16_t *)0x1FF800FA; // Kalibracja przy 30°C
-    const uint16_t *TS_CAL2 = (uint16_t *)0x1FF800FE; // Kalibracja przy 110°C
-
-    // Interpolacja liniowa na podstawie danych kalibracyjnych
-    float temperature = ((float)(adcValue - *TS_CAL1)) * (110.0 - 30.0) /
-                        (*TS_CAL2 - *TS_CAL1) + 30.0;
-    return temperature;
-}
-
-void temperatureToBytes(float temperature, uint8_t *data) {
-    int tempInt = (int)temperature;
-    int tempFrac = (int)((temperature - tempInt) * 100);  // Część dziesiętna
-    data[0] = (uint8_t)(tempInt >> 8);   // Najbardziej znaczący bajt całkowitej części
-    data[1] = (uint8_t)(tempInt & 0xFF); // Mniej znaczący bajt całkowitej części
-    data[2] = (uint8_t)(tempFrac >> 8);  // Najbardziej znaczący bajt części dziesiętnej
-    data[3] = (uint8_t)(tempFrac & 0xFF); // Mniej znaczący bajt części dziesiętnej
-}
+// Zmienna do mierzenia czasu w trybie nadawania
+#define SEND_PERIOD_MS 2000 // Czas między wysyłaniem wiadomości (2 sekundy)
+unsigned long lastSendTime = 0;
+bool sendTemperatureNext = true; // Przełącznik wiadomości (temperatura/wilgotność)
 
 void setup() {
     Serial.begin(115200);
-    Serial.println("-- LoRa Sender/Receiver --");
+    Serial.println("-- LoRa Universal Sender/Receiver --");
 
-
+    // Inicjalizacja LoRa
+    Serial.println("Initializing LoRa...");
     while (!loraRadio.begin(&SerialLora)) {
-        Serial.println("LoRa module not ready");
+        Serial.println("LoRa module not ready, retrying...");
         delay(1000);
     }
     Serial.println("LoRa module ready");
 
-    if (isSender) {
-        enableTemperatureSensor();
-        configureADC();
+    // Inicjalizacja DHT (tylko dla nadawcy)
+    if (IS_SENDER) {
+        dht.begin();
+        Serial.println("DHT22 Initialized");
     }
 }
 
 void loop() {
-    uint8_t rcvData[64];  // Tablica do przechowywania danych
-
-    // Nadajnik
-    if (isSender) {
-        uint16_t adcValue = readTemperatureADC();
-        float temperature = calculateTemperature(adcValue);
-
-        uint8_t temperatureData[4];
-        temperatureToBytes(temperature, temperatureData); // Zamiana temperatury na dane do wysłania
-
-        loraRadio.write(temperatureData, 4); // Wyślij temperaturę jako 4 bajty
-        Serial.print("Sent Temperature: ");
-        Serial.println(temperature);  // Wypisz temperaturę na serialu
-        timer = millis();
-
-        // Sprawdź, czy minęło 1 sekunda
-        if (millis() - timer >= SEND_PERIOD_MS) {
-            // Reset timer i ponów wysyłanie
-            timer = millis();
-        }
+    if (IS_SENDER) {
+        handleSender();
+    } else {
+        handleReceiver();
     }
+}
 
-    // Odbiornik
-    else {
-        int packetSize = loraRadio.read(rcvData);  // Odczyt danych z LoRa
+void handleSender() {
+    // Sprawdź, czy nadszedł czas na wysyłanie danych
+    if (millis() - lastSendTime >= SEND_PERIOD_MS) {
+        float temperature = dht.readTemperature(); // W °C
+        float humidity = dht.readHumidity();       // W %
 
-        if (packetSize > 0) {  // Jeśli odebrano dane
-            float receivedTemperature;
-            // Zamiana odebranych bajtów na temperaturę
-            int tempInt = (rcvData[0] << 8) | rcvData[1];
-            int tempFrac = (rcvData[2] << 8) | rcvData[3];
-            receivedTemperature = (float)tempInt + (float)tempFrac / 100.0;
+        // Obsługa błędów odczytu
+        if (isnan(temperature) || isnan(humidity)) {
+            Serial.println("Failed to read from DHT sensor!");
+            return;
+        }
 
+        uint8_t data[4];
+        if (sendTemperatureNext) {
+            encodeToBytes(temperature, data);
+            loraRadio.write(data, 4);
+            Serial.print("Sent Temperature: ");
+            Serial.print(temperature);
+            Serial.println(" °C");
+        } else {
+            encodeToBytes(humidity, data);
+            loraRadio.write(data, 4);
+            Serial.print("Sent Humidity: ");
+            Serial.print(humidity);
+            Serial.println(" %");
+        }
+
+        // Przełącz wiadomość i zaktualizuj czas
+        sendTemperatureNext = !sendTemperatureNext;
+        lastSendTime = millis();
+    }
+}
+
+void handleReceiver() {
+    uint8_t receivedData[4];
+    int packetSize = loraRadio.read(receivedData); // Odczyt danych
+
+    if (packetSize > 0) {
+        // Dekodowanie danych
+        float value = decodeToFloat(receivedData);
+
+        // Wyświetlenie odebranych danych
+        static bool expectingTemperature = true;
+        if (expectingTemperature) {
             Serial.print("Received Temperature: ");
-            Serial.println(receivedTemperature);  // Wypisz odebraną temperaturę
+            Serial.print(value);
+            Serial.println(" °C");
+        } else {
+            Serial.print("Received Humidity: ");
+            Serial.print(value);
+            Serial.println(" %");
         }
+
+        // Przełącz oczekiwanie na następną wiadomość
+        expectingTemperature = !expectingTemperature;
     }
+}
+
+void encodeToBytes(float value, uint8_t *data) {
+    int32_t valueInt = (int32_t)(value * 100); // Konwersja na int z 2 miejscami po przecinku
+    data[0] = (uint8_t)(valueInt >> 24);
+    data[1] = (uint8_t)(valueInt >> 16);
+    data[2] = (uint8_t)(valueInt >> 8);
+    data[3] = (uint8_t)valueInt;
+}
+
+float decodeToFloat(uint8_t *data) {
+    int32_t value = (data[0] << 24) |
+                    (data[1] << 16) |
+                    (data[2] << 8) |
+                    data[3];
+    return (float)value / 100.0; // Przywracanie oryginalnej wartości
 }
