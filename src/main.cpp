@@ -1,127 +1,142 @@
-#include <Adafruit_Sensor.h>
-#include <DHT.h>
-#include <DHT_U.h>
-#include <LoRaRadio.h>
+#include "main.h"
+#include "lora.h"
+#include "bme280_sensor.h"
+#include "AS7262_sensor.h"
+#include "ADC.h"
 
-// Konfiguracja trybu pracy (nadawca/odbiornik)
-#define IS_SENDER true // Ustaw na `false`, aby włączyć tryb odbiornika
+uint8_t requestMessage[1];
+uint8_t receivedMessage[MESSAGE_SIZE];
+bool SlaveRequestProcessingFLAG = false;
 
-// Konfiguracja DHT22 (dla nadajnika)
-#define DHTPIN D7       // Pin, do którego podłączony jest DHT22
-#define DHTTYPE DHT22   // Typ czujnika (DHT22)
-DHT dht(DHTPIN, DHTTYPE);
+bool interruptState = false;
+volatile int interruptLedCount = 0;
 
-void handleSender();
-void handleReceiver();
-void encodeToBytes(float value, uint8_t *data);
-float decodeToFloat(uint8_t *data);
+BME280_DataRead_t BME_read;
+BME280_DataReceived_t BME_received;
+AS7262_DataRead_t AS_read;
+AS7262_DataReceived_t AS_received;
+Sensors_DataRead sensorsData;
+
+// Create instance of TIM2
+HardwareTimer *MyTim = new HardwareTimer(TIM2);
 
 
-// Konfiguracja LoRa
-HardwareSerial SerialLora(D2, D8); // Serial dla modułu LoRa (RX, TX)
+void setup()
+{
+  pinMode(MODE_PIN, INPUT_PULLUP);
+  HAL_StatusTypeDef* init_errors = initRegs();
 
-// Zmienna do mierzenia czasu w trybie nadawania
-#define SEND_PERIOD_MS 2000 // Czas między wysyłaniem wiadomości (2 sekundy)
-unsigned long lastSendTime = 0;
-bool sendTemperatureNext = true; // Przełącznik wiadomości (temperatura/wilgotność)
-
-void setup() {
-    Serial.begin(115200);
-    Serial.println("-- LoRa Universal Sender/Receiver --");
-
-    // Inicjalizacja LoRa
-    Serial.println("Initializing LoRa...");
-    while (!loraRadio.begin(&SerialLora)) {
-        Serial.println("LoRa module not ready, retrying...");
-        delay(1000);
-    }
-    Serial.println("LoRa module ready");
-
-    // Inicjalizacja DHT (tylko dla nadawcy)
-    if (IS_SENDER) {
-        dht.begin();
-        Serial.println("DHT22 Initialized");
-    }
+  if (isSlave())
+  {
+    Serial.println("[INFO] ADC Init Errors: ");
+    Serial.print("  ADC Initialization: ");
+    Serial.println(init_errors[0]);
+    Serial.print("  ADC Channel Configuration: ");
+    Serial.println(init_errors[1]);
+    Serial.print("  ADC Start: ");
+    Serial.println(init_errors[2]);
+    Serial.println("SLAVE mode is ON");
+    
+    /* Sensors HardwareInit */
+    BME280::HardwareInit();
+    AS7262::HardwareInit();
+  } else
+  {
+    Serial.println("MASTER mode is ON");
+  }
 }
 
-void loop() {
-    if (IS_SENDER) {
-        handleSender();
-    } else {
-        handleReceiver();
+
+void loop()
+{
+  if (isSlave())
+  { /* Process request */
+    if ((loraRadio.read(requestMessage) == EOT) && (SlaveRequestProcessingFLAG == false))
+    {
+      SlaveRequestProcessingFLAG = true;
+      MyTim->resume(); // Start TIM2 and blinking
+      memset(requestMessage, 0, 1);
+      Serial.println("[INFO] Data request received");
     }
-}
 
-void handleSender() {
-    // Sprawdź, czy nadszedł czas na wysyłanie danych
-    if (millis() - lastSendTime >= SEND_PERIOD_MS) {
-        float temperature = dht.readTemperature(); // W °C
-        float humidity = dht.readHumidity();       // W %
-
-        // Obsługa błędów odczytu
-        if (isnan(temperature) || isnan(humidity)) {
-            Serial.println("Failed to read from DHT sensor!");
-            return;
-        }
-
-        uint8_t data[4];
-        if (sendTemperatureNext) {
-            encodeToBytes(temperature, data);
-            loraRadio.write(data, 4);
-            Serial.print("Sent Temperature: ");
-            Serial.print(temperature);
-            Serial.println(" °C");
-        } else {
-            encodeToBytes(humidity, data);
-            loraRadio.write(data, 4);
-            Serial.print("Sent Humidity: ");
-            Serial.print(humidity);
-            Serial.println(" %");
-        }
-
-        // Przełącz wiadomość i zaktualizuj czas
-        sendTemperatureNext = !sendTemperatureNext;
-        lastSendTime = millis();
+    if (SlaveRequestProcessingFLAG)
+    { /* Read data from sensor and send it */
+      if (BME_ACTIVE)
+      {
+        BME280::ReadData(&BME_read);
+        sensorsData.BME_sensorData = BME_read;
+      }
+      if (AS_ACTIVE)
+      {
+        AS7262::ReadData(&AS_read);
+        sensorsData.AS_sensorData = AS_read;
+      }
+      LoRa::SendResponse(&sensorsData);
+      delay(2000);  // Wait for the message to be sent
+      Serial.println("Data sent");
+      SlaveRequestProcessingFLAG = false;
     }
-}
-
-void handleReceiver() {
-    uint8_t receivedData[4];
-    int packetSize = loraRadio.read(receivedData); // Odczyt danych
-
-    if (packetSize > 0) {
-        // Dekodowanie danych
-        float value = decodeToFloat(receivedData);
-
-        // Wyświetlenie odebranych danych
-        static bool expectingTemperature = true;
-        if (expectingTemperature) {
-            Serial.print("Received Temperature: ");
-            Serial.print(value);
-            Serial.println(" °C");
-        } else {
-            Serial.print("Received Humidity: ");
-            Serial.print(value);
-            Serial.println(" %");
-        }
-
-        // Przełącz oczekiwanie na następną wiadomość
-        expectingTemperature = !expectingTemperature;
+  } else
+  {
+    if (interruptState)
+    { /* Send request to slave */
+      MyTim->resume();     // Start TIM2 and blinking
+      LoRa::SendRequest();
+      interruptState = !interruptState;
     }
+
+    if (loraRadio.read(receivedMessage) > 0)
+    {
+      LoRa::ReadData(receivedMessage);
+    }
+  } 
 }
 
-void encodeToBytes(float value, uint8_t *data) {
-    int32_t valueInt = (int32_t)(value * 100); // Konwersja na int z 2 miejscami po przecinku
-    data[0] = (uint8_t)(valueInt >> 24);
-    data[1] = (uint8_t)(valueInt >> 16);
-    data[2] = (uint8_t)(valueInt >> 8);
-    data[3] = (uint8_t)valueInt;
+HAL_StatusTypeDef* initRegs(void)
+{
+  LoRa::ShieldInit(); // There is no need to pass module type, it is defined in config.h
+
+  /* Init data container structs */
+  BME280::DataInit(&BME_read);
+  AS7262::DataInit(&AS_read);
+
+  /* Configure PA5 (builtin LED) */
+  pinMode(LED_GREEN, OUTPUT); 
+
+  /* Init Timer */
+  MyTim->setOverflow(30, HERTZ_FORMAT); // Set interrupt interval ~33ms
+  MyTim->attachInterrupt(updateLedState);
+
+  HAL_StatusTypeDef* status_arr = 0;  // Array of ADC error statuses
+  if (isSlave())
+  {
+    status_arr = ADC_Init(); 
+  }
+  else
+  {
+    attachInterrupt(digitalPinToInterrupt(BOARD_BTN), ButtonClickInterrupt, RISING);
+  }
+  return status_arr;
 }
 
-float decodeToFloat(uint8_t *data) {
-    int32_t value = (data[0] << 24) |
-                    (data[1] << 16) |
-                    (data[2] << 8) |
-                    data[3];
-    return (float)value / 100.0; // Przywracanie oryginalnej wartości
+void updateLedState(void)
+{
+  digitalWrite(LED_GREEN, !digitalRead(LED_GREEN)); // Change state of LED
+  interruptLedCount++;
+  if (interruptLedCount >= 8) // After 8th change -> turn off timer
+  { 
+    MyTim->pause();
+    interruptLedCount = 0;
+    digitalWrite(LED_GREEN, false); // In case of LED staying turned ON
+  }
+}
+
+void ButtonClickInterrupt(void)
+{
+  interruptState = !interruptState;
+}
+
+bool isSlave(void) // Indicate device mode 0 = Master, 1 = Slave
+{
+  return digitalRead(MODE_PIN) == HIGH;
 }
